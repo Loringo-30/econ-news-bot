@@ -395,21 +395,36 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
     corp = [it for it in items if it.category == "corporate_innovation"]
 
     # ---------- Vocabulary index at the top ----------
+    # Layout: one word per row, full width. Three columns:
+    #   [article# + CEFR badge]   [English word]   [Japanese translation]
+    # Uses a simple table -- renders identically on Gmail, Apple Mail, Outlook,
+    # and mobile clients. Each row stretches to the full available width.
     all_vocab = _collect_all_vocab(items)
     vocab_section = ""
     if all_vocab:
         vocab_rows = []
-        for v, article_idx in all_vocab:
+        for i, (v, article_idx) in enumerate(all_vocab):
             cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
+            cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
+            # Subtle zebra striping for readability
+            row_bg = "#ffffff" if i % 2 == 0 else "#faf8ff"
             vocab_rows.append(
-                f'<tr>'
-                f'<td style="padding:5px 10px 5px 0;vertical-align:top;'
-                f'font-size:11px;color:#999;width:30px;">#{article_idx}</td>'
-                f'<td style="padding:5px 10px 5px 0;vertical-align:top;'
-                f'font-size:10px;font-weight:700;color:{cefr_color};width:30px;">{escape(v.cefr)}</td>'
-                f'<td style="padding:5px 12px 5px 0;vertical-align:top;'
-                f'font-size:13px;font-weight:600;color:#222;">{escape(v.word)}</td>'
-                f'<td style="padding:5px 0;vertical-align:top;font-size:13px;color:#444;">{escape(v.japanese)}</td>'
+                f'<tr style="background:{row_bg};">'
+                # Article number + CEFR badge (compact, left-aligned)
+                f'<td style="padding:8px 10px;vertical-align:middle;white-space:nowrap;'
+                f'font-size:11px;color:{cefr_color};font-weight:700;">'
+                f'<span style="display:inline-block;background:{cefr_bg};'
+                f'padding:2px 7px;border-radius:8px;">'
+                f'#{article_idx} &middot; {escape(v.cefr)}</span>'
+                f'</td>'
+                # English word
+                f'<td style="padding:8px 10px;vertical-align:middle;'
+                f'font-size:14px;font-weight:600;color:#111;">'
+                f'{escape(v.word)}</td>'
+                # Japanese translation (takes remaining width)
+                f'<td style="padding:8px 10px;vertical-align:middle;'
+                f'font-size:14px;color:#555;width:100%;">'
+                f'{escape(v.japanese)}</td>'
                 f'</tr>'
             )
         vocab_section = f"""
@@ -419,12 +434,13 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
               📚 Vocabulary (CEFR C1-C2)
             </div>
             <div style="font-size:11px;color:#888;margin-top:3px;">
-              Advanced English vocabulary from today's articles, with Japanese translations
+              Advanced English vocabulary from today's articles, with Japanese translations.
+              <span style="color:#aaa;">#N = article number</span>
             </div>
           </td></tr>
-          <tr><td style="padding:8px 0 12px 0;">
-            <table style="width:100%;border-collapse:collapse;background:#faf8ff;
-                          border-radius:6px;padding:8px;">
+          <tr><td style="padding:10px 0 14px 0;">
+            <table style="width:100%;border-collapse:collapse;border-radius:8px;
+                          overflow:hidden;border:1px solid #ece7f5;">
               {''.join(vocab_rows)}
             </table>
           </td></tr>
@@ -463,25 +479,31 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
                     f'{escape(it.commentary)}</div>'
                 )
 
-            # Per-article vocabulary summary
+            # Per-article vocabulary -- same one-row-per-word layout as the index.
             vocab_inline = ""
             if it.vocabulary:
-                vocab_chips = []
+                vocab_rows_local = []
                 for v in it.vocabulary:
-                    cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
                     cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
-                    vocab_chips.append(
+                    cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
+                    vocab_rows_local.append(
+                        f'<tr>'
+                        f'<td style="padding:4px 8px 4px 0;vertical-align:middle;'
+                        f'white-space:nowrap;font-size:10px;color:{cefr_color};'
+                        f'font-weight:700;">'
                         f'<span style="display:inline-block;background:{cefr_bg};'
-                        f'color:{cefr_color};font-size:11px;padding:3px 8px;border-radius:8px;'
-                        f'margin:3px 4px 3px 0;">'
-                        f'<b>{escape(v.word)}</b> = {escape(v.japanese)} '
-                        f'<span style="opacity:0.6;font-size:9px;">({escape(v.cefr)})</span>'
-                        f'</span>'
+                        f'padding:1px 6px;border-radius:6px;">{escape(v.cefr)}</span>'
+                        f'</td>'
+                        f'<td style="padding:4px 10px 4px 0;vertical-align:middle;'
+                        f'font-size:13px;font-weight:600;color:#111;">{escape(v.word)}</td>'
+                        f'<td style="padding:4px 0;vertical-align:middle;'
+                        f'font-size:13px;color:#555;width:100%;">{escape(v.japanese)}</td>'
+                        f'</tr>'
                     )
                 vocab_inline = (
-                    f'<div style="margin-top:8px;line-height:1.9;">'
-                    f'{"".join(vocab_chips)}'
-                    f'</div>'
+                    f'<table style="width:100%;border-collapse:collapse;margin-top:10px;">'
+                    f'{"".join(vocab_rows_local)}'
+                    f'</table>'
                 )
 
             rows.append(f"""
@@ -522,8 +544,9 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
     )
 
     return f"""<!doctype html>
-<html><body style="font-family:-apple-system,'Hiragino Sans','Yu Gothic',Segoe UI,Helvetica,Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px;">
-  <table style="max-width:680px;margin:0 auto;background:#fff;border-radius:6px;padding:24px;">
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="font-family:-apple-system,'Hiragino Sans','Yu Gothic',Segoe UI,Helvetica,Arial,sans-serif;background:#f4f4f4;margin:0;padding:12px;">
+  <table style="max-width:680px;width:100%;margin:0 auto;background:#fff;border-radius:6px;padding:16px;box-sizing:border-box;">
     <tr><td>
       <h1 style="margin:0 0 4px 0;font-size:22px;color:#1a4d8c;">
         Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines
