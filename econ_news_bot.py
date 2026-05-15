@@ -88,7 +88,7 @@ class NewsItem:
     published: datetime
     rank: int = 0
     category: str = ""
-    commentary_jp: str = ""
+    commentary: str = ""
     also_reported_by: list[str] = field(default_factory=list)
 
 
@@ -198,12 +198,13 @@ Selection criteria:
 - A balanced mix across topics: don't pick 8 stories about the same Fed decision
 
 Split the 10 picks into two categories:
-- "macro" (5 stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency
-- "corporate_geo" (5 stories): companies, innovation/tech, M&A, big tech, AI/semiconductors, EVs, and geopolitics with economic impact (trade wars, tariffs, sanctions, supply chain)
+- "macro" (3 stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency
+- "corporate_geo" (7 stories): companies, innovation/tech, M&A, big tech, AI/semiconductors, EVs, and geopolitics with economic impact (trade wars, tariffs, sanctions, supply chain)
 
-For each pick, write a 2-4 sentence commentary IN JAPANESE explaining:
+For each pick, write a 2-4 sentence commentary IN ENGLISH explaining:
 - Why this story matters (impact, who is affected, why now)
 - Brief background context if useful for understanding
+- the list of Japanese translation of CEFR C1-C2 level vocabulary in the news feed
 
 Also note which outlets reported the same story (using the input list -- match by content similarity, not exact title).
 
@@ -212,20 +213,20 @@ Return your answer as STRICT JSON in this exact structure. Do NOT wrap in markdo
   "macro": [
     {
       "id": <int, the id of the chosen item from the input list>,
-      "commentary_jp": "<2-4 sentences in Japanese>",
+      "commentary": "<3-5 sentences>",
       "also_reported_by_ids": [<ids of other items that cover the same story>]
     }
   ],
   "corporate_geo": [
-    {"id": <int>, "commentary_jp": "<...>", "also_reported_by_ids": [<int>]}
+    {"id": <int>, "commentary": "<...>", "also_reported_by_ids": [<int>]}
   ]
 }
 
 Important rules:
 - Output ONLY valid JSON, nothing else
-- Exactly 5 items in each category (10 total)
+- Exactly 3 items for macro and 7 ietms for corporate_geo categories (10 total)
 - Use the integer id from the input list
-- commentary_jp MUST be Japanese (日本語), not English or Chinese
+- commentary MUST be English, NOT Chinese
 - also_reported_by_ids may be an empty list if only one outlet covered the story"""
 
 
@@ -251,7 +252,7 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
 
     user_message = (
         f"Here are {len(items)} recent economic news items from major outlets. "
-        f"Select the 10 most important and write Japanese commentary as instructed.\n\n"
+        f"Select the 10 most important and write commentary as instructed.\n\n"
         f"--- ITEMS ---\n{catalog}"
     )
 
@@ -314,7 +315,7 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
                 continue
             item.category = category
             item.rank = rank
-            item.commentary_jp = pick.get("commentary_jp", "").strip()
+            item.commentary = pick.get("commentary", "").strip()
             also_ids = pick.get("also_reported_by_ids", [])
             also_outlets = []
             for aid in also_ids:
@@ -365,12 +366,12 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
                 outlets_line = ""
 
             commentary_html = ""
-            if it.commentary_jp:
+            if it.commentary:
                 commentary_html = (
                     f'<div style="background:#f8f9fb;border-left:3px solid #1a4d8c;'
                     f'padding:10px 14px;margin-top:10px;color:#222;font-size:13px;'
                     f'line-height:1.7;border-radius:0 4px 4px 0;">'
-                    f'{escape(it.commentary_jp)}</div>'
+                    f'{escape(it.commentary)}</div>'
                 )
 
             rows.append(f"""
@@ -452,8 +453,8 @@ def build_email_text(items: list[NewsItem], edition_jp: str) -> str:
             if it.also_reported_by:
                 lines.append(f"   他の報道: {', '.join(it.also_reported_by[:6])}"
                              f"{'…' if len(it.also_reported_by) > 6 else ''}")
-            if it.commentary_jp:
-                lines.append(f"   💬 {it.commentary_jp}")
+            if it.commentary:
+                lines.append(f"   💬 {it.commentary}")
             lines.append(f"   {it.link}")
             lines.append("")
 
