@@ -1,14 +1,10 @@
 name: Economic News Bot
 
-# Schedule: twice a day at 7 AM and 9 PM Japan time (JST = UTC+9)
-# Cron times below are in UTC:
-#   07:00 JST = 22:00 UTC (previous day)
-#   21:00 JST = 12:00 UTC
+# 毎日 7:00 JST (= 22:00 UTC 前日) と 21:00 JST (= 12:00 UTC) に実行
 on:
   schedule:
-    - cron: '0 22 * * *'   # 07:00 JST (morning edition)
-    - cron: '0 12 * * *'   # 21:00 JST (evening edition)
-  # Also allow manual trigger from the GitHub UI for testing
+    - cron: '0 22 * * *'   # 07:00 JST (朝刊)
+    - cron: '0 12 * * *'   # 21:00 JST (夕刊)
   workflow_dispatch:
 
 jobs:
@@ -16,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -29,6 +25,10 @@ jobs:
 
       - name: Run the news bot
         env:
+          # AI (DeepSeek)
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: 'deepseek-chat'
+          # SMTP
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -36,10 +36,10 @@ jobs:
           FROM_ADDR: ${{ secrets.FROM_ADDR }}
           FROM_NAME: ${{ secrets.FROM_NAME }}
           TO_ADDRS:  ${{ secrets.TO_ADDRS }}
+          # Behavior
           LOOKBACK_HOURS: '14'
-          TOP_N: '10'
           MACRO_COUNT: '5'
           CORPORATE_GEO_COUNT: '5'
-          SUMMARY_CHAR_LIMIT: '600'
+          MAX_ITEMS_TO_AI: '150'
           LOG_LEVEL: 'INFO'
         run: python econ_news_bot.py
