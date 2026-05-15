@@ -1,0 +1,29 @@
+name: Test DeepSeek Key
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test API key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          pip install openai
+          python3 -c "
+          import os
+          from openai import OpenAI
+          key = os.environ.get('DEEPSEEK_API_KEY', '')
+          print(f'Key starts with: {key[:10]}...')
+          print(f'Key length: {len(key)}')
+          client = OpenAI(api_key=key, base_url='https://api.deepseek.com')
+          response = client.chat.completions.create(
+              model='deepseek-chat',
+              messages=[{'role': 'user', 'content': 'Say OK'}],
+              max_tokens=10,
+          )
+          print('Response:', response.choices[0].message.content)
+          print('SUCCESS')
+          "
