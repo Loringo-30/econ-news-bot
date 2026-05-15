@@ -1,0 +1,40 @@
+name: Economic News Bot
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 07:00 JST (morning edition)
+    - cron: '0 12 * * *'   # 21:00 JST (evening edition)
+  workflow_dispatch:
+
+jobs:
+  send-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the news bot
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          FROM_ADDR: ${{ secrets.FROM_ADDR }}
+          FROM_NAME: ${{ secrets.FROM_NAME }}
+          TO_ADDRS:  ${{ secrets.TO_ADDRS }}
+          LOOKBACK_HOURS: '14'
+          TOP_N: '10'
+          MACRO_COUNT: '5'
+          CORPORATE_GEO_COUNT: '5'
+          SUMMARY_CHAR_LIMIT: '600'
+          LOG_LEVEL: 'INFO'
+        run: python econ_news_bot.py
