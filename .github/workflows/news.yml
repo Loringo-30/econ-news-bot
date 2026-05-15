@@ -3,8 +3,8 @@ name: Economic News Bot
 # 毎日 7:00 JST (= 22:00 UTC 前日) と 21:00 JST (= 12:00 UTC) に実行
 on:
   schedule:
-    - cron: '0 22 * * *'   # 07:00 JST (朝刊)
-    - cron: '0 12 * * *'   # 21:00 JST (夕刊)
+    - cron: '0 22 * * *'   # 07:00 JST (morning edition)
+    - cron: '0 12 * * *'   # 21:00 JST (evening edition)
   workflow_dispatch:
 
 jobs:
@@ -36,10 +36,10 @@ jobs:
           FROM_ADDR: ${{ secrets.FROM_ADDR }}
           FROM_NAME: ${{ secrets.FROM_NAME }}
           TO_ADDRS:  ${{ secrets.TO_ADDRS }}
-          # Behavior
+          # Behavior: 3 macro + 7 corporate/innovation = 10 stories
           LOOKBACK_HOURS: '14'
-          MACRO_COUNT: '5'
-          CORPORATE_GEO_COUNT: '5'
+          MACRO_COUNT: '3'
+          CORPORATE_INNOVATION_COUNT: '7'
           MAX_ITEMS_TO_AI: '150'
           LOG_LEVEL: 'INFO'
         run: python econ_news_bot.py
