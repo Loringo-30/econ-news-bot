@@ -2,14 +2,18 @@
 Economic News Bot (AI-powered, DeepSeek backend)
 -------------------------------------------------
 Fetches latest economic news from major RSS feeds and uses DeepSeek AI
-to select the 10 most important stories and write Japanese commentary.
+to select 10 important stories.
+
+Each story includes:
+  - English commentary (2-4 sentences) explaining why it matters
+  - A CEFR C1/C2 vocabulary list with Japanese translations
+    (great for English study at advanced level)
+
+Split: 3 macro stories + 7 corporate/innovation stories (configurable).
 
 DeepSeek pricing (V3.2 / V4-flash, May 2026):
   - Input:  $0.28 / 1M tokens (cache miss), $0.028 / 1M tokens (cache hit)
   - Output: $0.42 / 1M tokens
-  - About 3.5x cheaper input, 12x cheaper output than Claude Haiku 4.5.
-
-Designed to be triggered by cron (or GitHub Actions) twice a day.
 """
 
 from __future__ import annotations
@@ -63,13 +67,10 @@ RSS_SOURCES: list[tuple[str, str, float]] = [
 ]
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "14"))
-MACRO_COUNT = int(os.getenv("MACRO_COUNT", "5"))
-CORPORATE_GEO_COUNT = int(os.getenv("CORPORATE_GEO_COUNT", "5"))
+MACRO_COUNT = int(os.getenv("MACRO_COUNT", "3"))
+CORPORATE_INNOVATION_COUNT = int(os.getenv("CORPORATE_INNOVATION_COUNT", "7"))
 MAX_ITEMS_TO_AI = int(os.getenv("MAX_ITEMS_TO_AI", "150"))
 
-# DeepSeek model. "deepseek-chat" is the legacy alias for non-thinking mode
-# (currently maps to V4-Flash). It will be deprecated 2026/07/24 in favor
-# of "deepseek-v4-flash" — change here when the time comes.
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
@@ -77,6 +78,13 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
+@dataclass
+class VocabEntry:
+    word: str           # English word/phrase from the article
+    japanese: str       # Japanese translation
+    cefr: str = "C1"    # "C1" or "C2"
+
 
 @dataclass
 class NewsItem:
@@ -87,8 +95,9 @@ class NewsItem:
     source_weight: float
     published: datetime
     rank: int = 0
-    category: str = ""
-    commentary: str = ""
+    category: str = ""              # "macro" or "corporate_innovation"
+    commentary: str = ""            # English commentary
+    vocabulary: list[VocabEntry] = field(default_factory=list)
     also_reported_by: list[str] = field(default_factory=list)
 
 
@@ -187,7 +196,7 @@ def trim_for_ai(items: list[NewsItem]) -> list[NewsItem]:
 # AI selection and commentary (DeepSeek backend)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a senior economics editor curating a twice-daily news digest for a sophisticated reader.
+SYSTEM_PROMPT = f"""You are a senior economics editor curating a twice-daily news digest for a sophisticated reader who is also studying English at CEFR C1-C2 level.
 
 Your task: from a list of recent headlines pulled from major outlets (Reuters, Bloomberg, FT, WSJ, CNBC, BBC, Economist, MarketWatch, Yahoo Finance), pick the 10 most important and impactful stories of the day.
 
@@ -198,36 +207,47 @@ Selection criteria:
 - A balanced mix across topics: don't pick 8 stories about the same Fed decision
 
 Split the 10 picks into two categories:
-- "macro" (3 stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency
-- "corporate_geo" (7 stories): companies, innovation/tech, M&A, big tech, AI/semiconductors, EVs, and geopolitics with economic impact (trade wars, tariffs, sanctions, supply chain)
+- "macro" ({MACRO_COUNT} stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency, geopolitics with macroeconomic impact (trade wars, tariffs, sanctions, supply chain)
+- "corporate_innovation" ({CORPORATE_INNOVATION_COUNT} stories): companies, innovation/tech, M&A, big tech, AI/semiconductors, EVs, biotech, startups
 
-For each pick, write a 2-4 sentence commentary IN ENGLISH explaining:
-- Why this story matters (impact, who is affected, why now)
-- Brief background context if useful for understanding
-- the list of Japanese translation of CEFR C1-C2 level vocabulary in the news feed
+For each pick, provide TWO things:
+
+1. **commentary** (2-4 sentences in ENGLISH explaining):
+   - Why this story matters (impact, who is affected, why now)
+   - Brief background context if useful for understanding
+
+2. **vocabulary** (a list of 3-6 CEFR C1-C2 level English words or phrases from the article title/summary/commentary, each with a Japanese translation):
+   - Focus on advanced vocabulary the reader would benefit from learning
+   - Skip A1-B2 level words (common words like "company", "market", "rise")
+   - Include each word's CEFR level ("C1" or "C2")
+   - Translation should be concise and natural Japanese
 
 Also note which outlets reported the same story (using the input list -- match by content similarity, not exact title).
 
 Return your answer as STRICT JSON in this exact structure. Do NOT wrap in markdown fences. Do NOT add prose:
-{
+{{
   "macro": [
-    {
-      "id": <int, the id of the chosen item from the input list>,
-      "commentary": "<3-5 sentences>",
-      "also_reported_by_ids": [<ids of other items that cover the same story>]
-    }
+    {{
+      "id": <int, id from the input list>,
+      "commentary": "<2-4 sentences in English>",
+      "vocabulary": [
+        {{"word": "<English word/phrase>", "japanese": "<Japanese translation>", "cefr": "C1"}}
+      ],
+      "also_reported_by_ids": [<ids of other items covering the same story>]
+    }}
   ],
-  "corporate_geo": [
-    {"id": <int>, "commentary": "<...>", "also_reported_by_ids": [<int>]}
+  "corporate_innovation": [
+    {{"id": <int>, "commentary": "<...>", "vocabulary": [...], "also_reported_by_ids": [<int>]}}
   ]
-}
+}}
 
 Important rules:
 - Output ONLY valid JSON, nothing else
-- Exactly 3 items for macro and 7 ietms for corporate_geo categories (10 total)
-- Use the integer id from the input list
-- commentary MUST be English, NOT Chinese
-- also_reported_by_ids may be an empty list if only one outlet covered the story"""
+- Exactly {MACRO_COUNT} items in "macro" and {CORPORATE_INNOVATION_COUNT} in "corporate_innovation" ({MACRO_COUNT + CORPORATE_INNOVATION_COUNT} total)
+- commentary MUST be in English
+- Japanese translations MUST be in Japanese (日本語), not Chinese or romaji
+- Each vocabulary entry's cefr field must be "C1" or "C2"
+- also_reported_by_ids may be empty list if no other outlet covered it"""
 
 
 def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
@@ -252,38 +272,47 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
 
     user_message = (
         f"Here are {len(items)} recent economic news items from major outlets. "
-        f"Select the 10 most important and write commentary as instructed.\n\n"
+        f"Select the {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} most important and write commentary "
+        f"plus a CEFR C1-C2 vocabulary list with Japanese translations as instructed.\n\n"
         f"--- ITEMS ---\n{catalog}"
     )
 
     log.info("Calling DeepSeek (%s) with %d candidate items...",
              DEEPSEEK_MODEL, len(items))
 
-    # Use response_format json_object for stricter JSON output.
-    # DeepSeek supports this OpenAI-compatible parameter.
-    response = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=8000,
-        temperature=0.3,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=8000,
+            temperature=0.3,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "402" in msg or "Insufficient Balance" in msg:
+            log.error(
+                "DeepSeek API balance is 0. Top up at https://platform.deepseek.com "
+                "(usually $2-5 lasts for months)."
+            )
+        elif "401" in msg or "Authentication" in msg:
+            log.error("DeepSeek API key is invalid. Check the DEEPSEEK_API_KEY secret.")
+        else:
+            log.error("DeepSeek API call failed: %s", msg)
+        raise
 
-    # Cost estimation. DeepSeek bills input cache hits vs misses separately.
     usage = response.usage
     in_tokens = usage.prompt_tokens
     out_tokens = usage.completion_tokens
-    # OpenAI-compatible usage may include cached_tokens via prompt_tokens_details
     cached = 0
     try:
         cached = getattr(usage, "prompt_tokens_details", None).cached_tokens or 0
     except AttributeError:
         cached = 0
     fresh = in_tokens - cached
-    # Per million tokens (May 2026 DeepSeek V3.2 / V4-flash rates)
     in_cost = (fresh * 0.28 + cached * 0.028) / 1_000_000
     out_cost = out_tokens * 0.42 / 1_000_000
     total_usd = in_cost + out_cost
@@ -304,7 +333,7 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
         raise
 
     selected: list[NewsItem] = []
-    for category in ("macro", "corporate_geo"):
+    for category in ("macro", "corporate_innovation"):
         picks = parsed.get(category, [])
         for rank, pick in enumerate(picks, start=1):
             try:
@@ -316,6 +345,20 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
             item.category = category
             item.rank = rank
             item.commentary = pick.get("commentary", "").strip()
+
+            # Parse vocabulary list
+            vocab_list = []
+            for v in pick.get("vocabulary", []):
+                try:
+                    word = str(v.get("word", "")).strip()
+                    jp = str(v.get("japanese", "")).strip()
+                    cefr = str(v.get("cefr", "C1")).strip().upper()
+                    if word and jp:
+                        vocab_list.append(VocabEntry(word=word, japanese=jp, cefr=cefr))
+                except (AttributeError, TypeError):
+                    continue
+            item.vocabulary = vocab_list
+
             also_ids = pick.get("also_reported_by_ids", [])
             also_outlets = []
             for aid in also_ids:
@@ -326,10 +369,10 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
             item.also_reported_by = sorted(set(also_outlets) - {item.source})
             selected.append(item)
 
-    log.info("AI selected %d items (%d macro + %d corp/geo)",
+    log.info("AI selected %d items (%d macro + %d corp/innov)",
              len(selected),
              sum(1 for x in selected if x.category == "macro"),
-             sum(1 for x in selected if x.category == "corporate_geo"))
+             sum(1 for x in selected if x.category == "corporate_innovation"))
     return selected
 
 
@@ -337,11 +380,57 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
 # Email rendering
 # ---------------------------------------------------------------------------
 
-def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
-    today_jp = datetime.now().strftime("%Y年%m月%d日 (%A)")
-    macro = [it for it in items if it.category == "macro"]
-    corp = [it for it in items if it.category == "corporate_geo"]
+def _collect_all_vocab(items: list[NewsItem]) -> list[tuple[VocabEntry, int]]:
+    """Collect all vocabulary across items, paired with their article index."""
+    result = []
+    for idx, it in enumerate(items, start=1):
+        for v in it.vocabulary:
+            result.append((v, idx))
+    return result
 
+
+def build_email_html(items: list[NewsItem], edition_en: str) -> str:
+    today_str = datetime.now().strftime("%A, %B %d, %Y")
+    macro = [it for it in items if it.category == "macro"]
+    corp = [it for it in items if it.category == "corporate_innovation"]
+
+    # ---------- Vocabulary index at the top ----------
+    all_vocab = _collect_all_vocab(items)
+    vocab_section = ""
+    if all_vocab:
+        vocab_rows = []
+        for v, article_idx in all_vocab:
+            cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
+            vocab_rows.append(
+                f'<tr>'
+                f'<td style="padding:5px 10px 5px 0;vertical-align:top;'
+                f'font-size:11px;color:#999;width:30px;">#{article_idx}</td>'
+                f'<td style="padding:5px 10px 5px 0;vertical-align:top;'
+                f'font-size:10px;font-weight:700;color:{cefr_color};width:30px;">{escape(v.cefr)}</td>'
+                f'<td style="padding:5px 12px 5px 0;vertical-align:top;'
+                f'font-size:13px;font-weight:600;color:#222;">{escape(v.word)}</td>'
+                f'<td style="padding:5px 0;vertical-align:top;font-size:13px;color:#444;">{escape(v.japanese)}</td>'
+                f'</tr>'
+            )
+        vocab_section = f"""
+          <tr><td style="padding:18px 0 6px 0;">
+            <div style="font-size:13px;font-weight:700;color:#7a3fd8;text-transform:uppercase;
+                        letter-spacing:0.5px;border-bottom:2px solid #7a3fd8;padding-bottom:6px;">
+              📚 Vocabulary (CEFR C1-C2)
+            </div>
+            <div style="font-size:11px;color:#888;margin-top:3px;">
+              Advanced English vocabulary from today's articles, with Japanese translations
+            </div>
+          </td></tr>
+          <tr><td style="padding:8px 0 12px 0;">
+            <table style="width:100%;border-collapse:collapse;background:#faf8ff;
+                          border-radius:6px;padding:8px;">
+              {''.join(vocab_rows)}
+            </table>
+          </td></tr>
+        """
+
+    # ---------- Article sections ----------
     def _section(title: str, subtitle: str, section_items: list[NewsItem], start_idx: int) -> str:
         if not section_items:
             return ""
@@ -353,11 +442,11 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
                 badge = (
                     f'<span style="display:inline-block;background:#d1f5e0;color:#0a6b2c;'
                     f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
-                    f'margin-left:6px;">📢 {n_outlets}社が報道</span>'
+                    f'margin-left:6px;">📢 {n_outlets} outlets</span>'
                 )
                 outlets_line = (
                     f'<div style="color:#888;font-size:11px;margin-top:3px;">'
-                    f'他の報道: {escape(", ".join(it.also_reported_by[:6]))}'
+                    f'Also reported by: {escape(", ".join(it.also_reported_by[:6]))}'
                     f'{"…" if len(it.also_reported_by) > 6 else ""}'
                     f'</div>'
                 )
@@ -370,8 +459,29 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
                 commentary_html = (
                     f'<div style="background:#f8f9fb;border-left:3px solid #1a4d8c;'
                     f'padding:10px 14px;margin-top:10px;color:#222;font-size:13px;'
-                    f'line-height:1.7;border-radius:0 4px 4px 0;">'
+                    f'line-height:1.6;border-radius:0 4px 4px 0;">'
                     f'{escape(it.commentary)}</div>'
+                )
+
+            # Per-article vocabulary summary
+            vocab_inline = ""
+            if it.vocabulary:
+                vocab_chips = []
+                for v in it.vocabulary:
+                    cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
+                    cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
+                    vocab_chips.append(
+                        f'<span style="display:inline-block;background:{cefr_bg};'
+                        f'color:{cefr_color};font-size:11px;padding:3px 8px;border-radius:8px;'
+                        f'margin:3px 4px 3px 0;">'
+                        f'<b>{escape(v.word)}</b> = {escape(v.japanese)} '
+                        f'<span style="opacity:0.6;font-size:9px;">({escape(v.cefr)})</span>'
+                        f'</span>'
+                    )
+                vocab_inline = (
+                    f'<div style="margin-top:8px;line-height:1.9;">'
+                    f'{"".join(vocab_chips)}'
+                    f'</div>'
                 )
 
             rows.append(f"""
@@ -386,6 +496,7 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
                     </div>
                     {outlets_line}
                     {commentary_html}
+                    {vocab_inline}
                   </td>
                 </tr>
             """)
@@ -400,13 +511,13 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
         """
 
     macro_section = _section(
-        "🌍 世界経済 &amp; アメリカ経済",
-        "中央銀行・インフレ・雇用・成長・市場・財政",
+        "🌍 Macro",
+        "World &amp; US economy: central banks, inflation, jobs, fiscal policy, trade",
         macro, 1,
     )
     corp_section = _section(
-        "🏢 企業・イノベーション &amp; 地政学",
-        "大手企業・M&amp;A・AI/半導体・貿易・国際情勢",
+        "🏢 Corporate &amp; Innovation",
+        "Big tech, M&amp;A, AI/semiconductors, biotech, startups",
         corp, len(macro) + 1,
     )
 
@@ -414,30 +525,44 @@ def build_email_html(items: list[NewsItem], edition_jp: str) -> str:
 <html><body style="font-family:-apple-system,'Hiragino Sans','Yu Gothic',Segoe UI,Helvetica,Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px;">
   <table style="max-width:680px;margin:0 auto;background:#fff;border-radius:6px;padding:24px;">
     <tr><td>
-      <h1 style="margin:0 0 4px 0;font-size:22px;color:#1a4d8c;">本日の重要経済ニュース 10選</h1>
-      <div style="color:#888;font-size:13px;margin-bottom:20px;">{edition_jp} &middot; {today_jp}</div>
+      <h1 style="margin:0 0 4px 0;font-size:22px;color:#1a4d8c;">
+        Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines
+      </h1>
+      <div style="color:#888;font-size:13px;margin-bottom:20px;">
+        {edition_en} &middot; {today_str}
+      </div>
       <table style="width:100%;border-collapse:collapse;">
+        {vocab_section}
         {macro_section}
         {corp_section}
       </table>
       <div style="color:#aaa;font-size:11px;margin-top:24px;border-top:1px solid #eee;padding-top:12px;">
-        AI（DeepSeek）が{len(RSS_SOURCES)}媒体のニュースから選別し、解説を生成しました。
+        Curated by AI (DeepSeek) from {len(RSS_SOURCES)} sources. Commentary in English with CEFR C1-C2 vocabulary translated to Japanese.
       </div>
     </td></tr>
   </table>
 </body></html>"""
 
 
-def build_email_text(items: list[NewsItem], edition_jp: str) -> str:
-    today_jp = datetime.now().strftime("%Y年%m月%d日 (%A)")
+def build_email_text(items: list[NewsItem], edition_en: str) -> str:
+    today_str = datetime.now().strftime("%A, %B %d, %Y")
     macro = [it for it in items if it.category == "macro"]
-    corp = [it for it in items if it.category == "corporate_geo"]
+    corp = [it for it in items if it.category == "corporate_innovation"]
     lines = [
-        f"本日の重要経済ニュース 10選 -- {edition_jp}",
-        today_jp,
+        f"Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines -- {edition_en}",
+        today_str,
         "=" * 60,
         "",
     ]
+
+    # Vocabulary index
+    all_vocab = _collect_all_vocab(items)
+    if all_vocab:
+        lines.append("## 📚 VOCABULARY (CEFR C1-C2)")
+        lines.append("-" * 60)
+        for v, article_idx in all_vocab:
+            lines.append(f"  #{article_idx} [{v.cefr}] {v.word} = {v.japanese}")
+        lines.append("")
 
     def _add(header: str, section: list[NewsItem], start_idx: int) -> None:
         if not section:
@@ -447,19 +572,22 @@ def build_email_text(items: list[NewsItem], edition_jp: str) -> str:
         for i, it in enumerate(section, start=start_idx):
             time = it.published.astimezone().strftime("%H:%M %Z")
             n_outlets = 1 + len(it.also_reported_by)
-            badge = f" [📢 {n_outlets}社が報道]" if n_outlets >= 2 else ""
+            badge = f" [📢 {n_outlets} outlets]" if n_outlets >= 2 else ""
             lines.append(f"{i}. {it.title}{badge}")
             lines.append(f"   {it.source} | {time}")
             if it.also_reported_by:
-                lines.append(f"   他の報道: {', '.join(it.also_reported_by[:6])}"
+                lines.append(f"   Also reported by: {', '.join(it.also_reported_by[:6])}"
                              f"{'…' if len(it.also_reported_by) > 6 else ''}")
             if it.commentary:
                 lines.append(f"   💬 {it.commentary}")
+            if it.vocabulary:
+                vocab_str = ", ".join(f"{v.word}={v.japanese}({v.cefr})" for v in it.vocabulary)
+                lines.append(f"   📚 {vocab_str}")
             lines.append(f"   {it.link}")
             lines.append("")
 
-    _add("世界経済 & アメリカ経済", macro, 1)
-    _add("企業・イノベーション & 地政学", corp, len(macro) + 1)
+    _add("MACRO -- World & US economy", macro, 1)
+    _add("CORPORATE & INNOVATION", corp, len(macro) + 1)
     return "\n".join(lines)
 
 
@@ -473,17 +601,17 @@ def send_email(items: list[NewsItem]) -> None:
     to_addrs = [a.strip() for a in os.environ["TO_ADDRS"].split(",") if a.strip()]
 
     hour = datetime.now().hour
-    edition_jp = "朝刊" if hour < 12 else "夕刊"
+    edition_en = "Morning Edition" if hour < 12 else "Evening Edition"
 
     msg = EmailMessage()
     msg["Subject"] = (
-        f"📊 本日の重要経済ニュース 10選 -- "
-        f"{edition_jp} ({datetime.now().strftime('%m月%d日')})"
+        f"📊 Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines -- "
+        f"{edition_en} ({datetime.now().strftime('%b %d')})"
     )
     msg["From"] = formataddr((from_name, from_addr))
     msg["To"] = ", ".join(to_addrs)
-    msg.set_content(build_email_text(items, edition_jp))
-    msg.add_alternative(build_email_html(items, edition_jp), subtype="html")
+    msg.set_content(build_email_text(items, edition_en))
+    msg.add_alternative(build_email_html(items, edition_en), subtype="html")
 
     log.info("Sending email to %s via %s:%d", to_addrs, smtp_host, smtp_port)
     context = ssl.create_default_context()
@@ -522,8 +650,9 @@ def main() -> int:
     log.info("Top %d picks:", len(selected))
     for it in selected:
         n_outlets = 1 + len(it.also_reported_by)
-        log.info("  %s #%d [%d outlets] %s -- %s",
-                 it.category, it.rank, n_outlets, it.source, it.title[:60])
+        log.info("  %s #%d [%d outlets, %d vocab] %s -- %s",
+                 it.category, it.rank, n_outlets, len(it.vocabulary),
+                 it.source, it.title[:60])
 
     send_email(selected)
     log.info("=== econ_news_bot run done ===")
