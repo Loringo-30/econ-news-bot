@@ -68,6 +68,11 @@ INCLUDE_REPLIES = os.getenv("INCLUDE_REPLIES", "false").lower() == "true"
 # How far back to keep tweets (in hours). Older tweets are dropped.
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "14"))
 
+# Delay between TwitterAPI.io requests (in seconds).
+# Free tier: 1 request per 5 seconds. Set to 6 for safety margin.
+# Paid tier: can lower to 0.2 or less.
+REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "6.0"))
+
 # Cap on tweets sent to AI (keeps prompt size and cost bounded).
 MAX_TWEETS_TO_AI = int(os.getenv("MAX_TWEETS_TO_AI", "200"))
 
@@ -254,6 +259,15 @@ def fetch_user_tweets(api_key: str, username: str, cutoff: datetime) -> list[Twe
             "TwitterAPI.io balance is exhausted. "
             "Top up at https://twitterapi.io."
         )
+    if resp.status_code == 429:
+        # Rate limited. Wait and retry once.
+        log.info("  @%s: rate limited, waiting 7s and retrying...", username)
+        time.sleep(7)
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.RequestException as e:
+            log.warning("  @%s: retry failed: %s", username, e)
+            return []
     if resp.status_code != 200:
         log.warning("  @%s: HTTP %d: %s", username, resp.status_code, resp.text[:200])
         return []
@@ -319,8 +333,11 @@ def fetch_all_tweets() -> list[Tweet]:
         log.info("[%d/%d] Fetching @%s", i, len(accounts), username)
         tweets = fetch_user_tweets(api_key, username, cutoff)
         all_tweets.extend(tweets)
-        # Small delay to be polite to the API (also avoids rate-limit hiccups)
-        time.sleep(0.15)
+        # TwitterAPI.io free tier limits requests to 1 every 5 seconds.
+        # Sleep 6s to stay safely under that. Paid plans allow ~1000 QPS,
+        # so lower this via REQUEST_DELAY_SECONDS if you upgrade.
+        if i < len(accounts):
+            time.sleep(REQUEST_DELAY_SECONDS)
 
     log.info("Fetched %d total tweets from %d accounts",
              len(all_tweets), len(accounts))
