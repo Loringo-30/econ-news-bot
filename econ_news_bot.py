@@ -174,31 +174,43 @@ def _parse_iso_datetime(s: str) -> datetime | None:
 
 def _extract_tweet(raw: dict, fallback_username: str) -> Tweet | None:
     """Convert TwitterAPI.io's raw tweet JSON into our Tweet dataclass.
-    TwitterAPI.io mirrors X's own field names closely."""
-    tid = str(raw.get("id") or "").strip()
-    text = (raw.get("text") or "").strip()
+    Fields vary a bit between endpoints, so we accept multiple variants."""
+    tid = str(raw.get("id") or raw.get("tweet_id") or "").strip()
+    text = (raw.get("text") or raw.get("full_text") or "").strip()
     if not tid or not text:
         return None
 
-    # Author info: TwitterAPI.io usually nests author under "author"
-    author = raw.get("author") or {}
-    username = (author.get("userName") or fallback_username or "").lstrip("@").lower()
+    # Author info: usually nested under "author"
+    author = raw.get("author") or raw.get("user") or {}
+    if not isinstance(author, dict):
+        author = {}
+    username = (
+        author.get("userName") or author.get("username")
+        or author.get("screen_name") or fallback_username or ""
+    ).lstrip("@").lower()
     display = author.get("name") or username
-    verified = bool(author.get("isVerified") or author.get("isBlueVerified"))
-    followers = int(author.get("followers") or 0)
+    verified = bool(
+        author.get("isVerified") or author.get("isBlueVerified")
+        or author.get("verified") or author.get("is_blue_verified")
+    )
+    followers = int(
+        author.get("followers") or author.get("followers_count") or 0
+    )
 
-    created_at = _parse_iso_datetime(raw.get("createdAt") or "")
+    created_at = _parse_iso_datetime(
+        raw.get("createdAt") or raw.get("created_at") or ""
+    )
     if created_at is None:
         return None
 
-    # Determine reply/retweet status. Field names vary a bit; try both.
     is_reply = bool(
         raw.get("isReply") or raw.get("inReplyToUsername")
-        or raw.get("inReplyToId")
+        or raw.get("inReplyToId") or raw.get("in_reply_to_user_id")
+        or raw.get("in_reply_to_status_id")
     )
     is_retweet = bool(
         raw.get("isRetweet") or raw.get("retweeted_tweet")
-        or text.startswith("RT @")
+        or raw.get("retweeted") or text.startswith("RT @")
     )
 
     url = raw.get("url") or f"https://twitter.com/{username}/status/{tid}"
@@ -212,9 +224,9 @@ def _extract_tweet(raw: dict, fallback_username: str) -> Tweet | None:
         author_followers=followers,
         created_at=created_at,
         url=url,
-        like_count=int(raw.get("likeCount") or 0),
-        retweet_count=int(raw.get("retweetCount") or 0),
-        reply_count=int(raw.get("replyCount") or 0),
+        like_count=int(raw.get("likeCount") or raw.get("favorite_count") or 0),
+        retweet_count=int(raw.get("retweetCount") or raw.get("retweet_count") or 0),
+        reply_count=int(raw.get("replyCount") or raw.get("reply_count") or 0),
         is_reply=is_reply,
         is_retweet=is_retweet,
     )
@@ -252,19 +264,33 @@ def fetch_user_tweets(api_key: str, username: str, cutoff: datetime) -> list[Twe
         log.warning("  @%s: response was not JSON", username)
         return []
 
-    # TwitterAPI.io returns tweets under a "tweets" key (sometimes under "data")
-    raw_tweets = (
-        payload.get("tweets")
-        or payload.get("data")
-        or (payload.get("data") or {}).get("tweets")
-        or []
-    )
+    # TwitterAPI.io response structure for /twitter/user/last_tweets is:
+    #   { "status": "success",
+    #     "data": { "tweets": [ {...}, {...} ], "pin_tweet": {...} },
+    #     "has_next_page": true, "next_cursor": "..." }
+    # Some endpoints put tweets directly at the top level under "tweets".
+    # Try both shapes.
+    raw_tweets = None
+    data = payload.get("data")
+    if isinstance(data, dict):
+        raw_tweets = data.get("tweets")
+    elif isinstance(data, list):
+        raw_tweets = data
+    if raw_tweets is None:
+        raw_tweets = payload.get("tweets")
+
+    if not isinstance(raw_tweets, list):
+        log.info("  @%s: no tweets in response (keys=%s)",
+                 username, list(payload.keys()))
+        return []
     if not raw_tweets:
         log.info("  @%s: no tweets returned", username)
         return []
 
     parsed = []
     for raw in raw_tweets[:TWEETS_PER_ACCOUNT]:
+        if not isinstance(raw, dict):
+            continue
         t = _extract_tweet(raw, username)
         if t and t.created_at >= cutoff:
             parsed.append(t)
