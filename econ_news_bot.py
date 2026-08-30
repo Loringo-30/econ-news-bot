@@ -585,6 +585,9 @@ def build_email_html(tweets: list[Tweet], edition_en: str) -> str:
         """
 
     # ---------- Article sections ----------
+    # Everything in the digest uses a single-column layout, so headers, vocab
+    # tables, and tweet content all span the full width. The tweet number is
+    # embedded inline in the header rather than being in its own narrow column.
     def _section(title: str, subtitle: str, section_tweets: list[Tweet], start_idx: int) -> str:
         if not section_tweets:
             return ""
@@ -615,10 +618,9 @@ def build_email_html(tweets: list[Tweet], edition_en: str) -> str:
                 f'</span>'
             )
 
-            # The tweet text itself (this replaces the RSS headline)
             tweet_text_html = (
                 f'<div style="color:#111;font-size:14px;line-height:1.5;'
-                f'margin-top:6px;white-space:pre-wrap;">{escape(t.text)}</div>'
+                f'margin-top:8px;white-space:pre-wrap;">{escape(t.text)}</div>'
             )
 
             commentary_html = ""
@@ -656,29 +658,33 @@ def build_email_html(tweets: list[Tweet], edition_en: str) -> str:
                     f'</table>'
                 )
 
+            # Each tweet: one full-width cell. The number is inline in the header.
             rows.append(f"""
-                <tr>
-                  <td style="padding:16px 8px;vertical-align:top;font-weight:bold;color:#888;width:30px;">{i}.</td>
-                  <td style="padding:16px 8px;vertical-align:top;">
-                    <div>
-                      <a href="{escape(t.url)}" style="color:#1a4d8c;text-decoration:none;font-weight:600;font-size:14px;">
-                        {escape(t.author_display)}{verified_mark}
-                        <span style="color:#888;font-weight:normal;">@{escape(t.author_username)}</span>
-                      </a>{badge}
-                    </div>
-                    <div style="color:#666;font-size:11px;margin-top:2px;">
-                      {local_time} &middot; {engagement}
-                    </div>
+                <tr><td style="padding:16px 0;border-top:1px solid #eee;">
+                  <div>
+                    <span style="display:inline-block;color:#888;font-weight:bold;
+                                 font-size:14px;margin-right:8px;">{i}.</span>
+                    <a href="{escape(t.url)}" style="color:#1a4d8c;text-decoration:none;
+                       font-weight:600;font-size:14px;">
+                      {escape(t.author_display)}{verified_mark}
+                      <span style="color:#888;font-weight:normal;">@{escape(t.author_username)}</span>
+                    </a>{badge}
+                  </div>
+                  <div style="color:#666;font-size:11px;margin-top:2px;padding-left:22px;">
+                    {local_time} &middot; {engagement}
+                  </div>
+                  <div style="padding-left:22px;">
                     {also_line}
                     {tweet_text_html}
                     {commentary_html}
                     {vocab_inline}
-                  </td>
-                </tr>
+                  </div>
+                </td></tr>
             """)
         return f"""
-          <tr><td style="padding:18px 0 6px 0;">
-            <div style="font-size:13px;font-weight:700;color:#1a4d8c;text-transform:uppercase;letter-spacing:0.5px;border-bottom:2px solid #1a4d8c;padding-bottom:6px;">
+          <tr><td style="padding:22px 0 6px 0;">
+            <div style="font-size:13px;font-weight:700;color:#1a4d8c;text-transform:uppercase;
+                        letter-spacing:0.5px;border-bottom:2px solid #1a4d8c;padding-bottom:6px;">
               {title}
             </div>
             <div style="font-size:11px;color:#888;margin-top:3px;">{subtitle}</div>
