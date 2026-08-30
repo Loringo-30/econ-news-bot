@@ -1,6 +1,5 @@
 name: Economic News Bot
 
-# 毎日 7:00 JST (= 22:00 UTC 前日) と 21:00 JST (= 12:00 UTC) に実行
 on:
   schedule:
     - cron: '0 22 * * *'   # 07:00 JST (morning edition)
