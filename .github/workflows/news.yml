@@ -1,5 +1,6 @@
 name: Economic News Bot
 
+# 毎日 7:00 JST (= 22:00 UTC 前日) と 21:00 JST (= 12:00 UTC) に実行
 on:
   schedule:
     - cron: '0 22 * * *'   # 07:00 JST (morning edition)
@@ -42,7 +43,8 @@ jobs:
           TWEETS_PER_ACCOUNT: '20'
           INCLUDE_REPLIES: 'false'
           INCLUDE_RETWEETS: 'false'
-          LOOKBACK_HOURS: '14'
+          LOOKBACK_HOURS: '24'
+          REQUEST_DELAY_SECONDS: '6.0'
           MAX_TWEETS_TO_AI: '200'
           MACRO_COUNT: '3'
           CORPORATE_INNOVATION_COUNT: '7'
