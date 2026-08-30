@@ -9,24 +9,24 @@
 # Example (delete and replace with your own):
 
 # ---- Macro economists / Central bank watchers ----
-# federalreserve
-# ecb
-# bankofjapan
-# LHSummers
-# paulkrugman
+federalreserve
+ecb
+bankofjapan
+LHSummers
+paulkrugman
 
 # ---- Financial journalists ----
-# lisaabramowicz1
-# tracyalloway
-# jasonzweigwsj
+lisaabramowicz1
+tracyalloway
+jasonzweigwsj
 
 # ---- Big tech / AI ----
-# elonmusk
-# sama
-# sundarpichai
-# satyanadella
+elonmusk
+sama
+sundarpichai
+satyanadella
 
 # ---- Business / markets ----
-# jimcramer
-# markets
-# ftfinancialnews
+jimcramer
+markets
+ftfinancialnews
