@@ -1,19 +1,16 @@
 """
-Economic News Bot (AI-powered, DeepSeek backend)
--------------------------------------------------
-Fetches latest economic news from major RSS feeds and uses DeepSeek AI
-to select 10 important stories.
+Economic News Bot (Twitter/X source, AI-powered via DeepSeek)
+--------------------------------------------------------------
+Fetches recent tweets from a curated list of Twitter/X accounts,
+sends them to DeepSeek AI to select the most important 10, and
+emails a digest with English commentary and CEFR C1-C2 vocabulary
+(with Japanese translations).
 
-Each story includes:
-  - English commentary (2-4 sentences) explaining why it matters
-  - A CEFR C1/C2 vocabulary list with Japanese translations
-    (great for English study at advanced level)
+Twitter data source: TwitterAPI.io  ($0.15 per 1,000 tweets)
+AI:                  DeepSeek        ($0.28 / 1M input, $0.42 / 1M output)
 
-Split: 3 macro stories + 7 corporate/innovation stories (configurable).
-
-DeepSeek pricing (V3.2 / V4-flash, May 2026):
-  - Input:  $0.28 / 1M tokens (cache miss), $0.028 / 1M tokens (cache hit)
-  - Output: $0.42 / 1M tokens
+The list of accounts to follow is stored in twitter_accounts.txt.
+Edit that file to change who the bot follows.
 """
 
 from __future__ import annotations
@@ -24,13 +21,15 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
 from html import escape
+from pathlib import Path
 
-import feedparser
+import requests
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -49,30 +48,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("econ_news_bot")
 
-RSS_SOURCES: list[tuple[str, str, float]] = [
-    ("Reuters Business",   "https://feeds.reuters.com/reuters/businessNews",          1.0),
-    ("Reuters Markets",    "https://feeds.reuters.com/reuters/USMarketsNews",         1.0),
-    ("FT Home",            "https://www.ft.com/?format=rss",                          1.0),
-    ("FT World",           "https://www.ft.com/world?format=rss",                     0.9),
-    ("Bloomberg Markets",  "https://feeds.bloomberg.com/markets/news.rss",            1.0),
-    ("Bloomberg Economics","https://feeds.bloomberg.com/economics/news.rss",          1.0),
-    ("WSJ Markets",        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",           0.95),
-    ("WSJ World",          "https://feeds.a.dj.com/rss/RSSWorldNews.xml",             0.85),
-    ("CNBC Economy",       "https://www.cnbc.com/id/20910258/device/rss/rss.html",    0.85),
-    ("CNBC Finance",       "https://www.cnbc.com/id/10000664/device/rss/rss.html",    0.85),
-    ("BBC Business",       "https://feeds.bbci.co.uk/news/business/rss.xml",          0.8),
-    ("The Economist Finance","https://www.economist.com/finance-and-economics/rss.xml",0.9),
-    ("Yahoo Finance",      "https://finance.yahoo.com/news/rssindex",                 0.7),
-    ("MarketWatch Top",    "https://feeds.marketwatch.com/marketwatch/topstories/",   0.8),
-]
+# ---- Twitter (TwitterAPI.io) ----
+TWITTERAPI_BASE_URL = os.getenv("TWITTERAPI_BASE_URL", "https://api.twitterapi.io")
+TWITTERAPI_ENDPOINT = "/twitter/user/last_tweets"
 
+# Path to file listing accounts to follow. Read at startup.
+ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "twitter_accounts.txt")
+
+# How many recent tweets to consider from each account. TwitterAPI.io returns
+# up to 20 per call by default; if you need more, add pagination logic.
+TWEETS_PER_ACCOUNT = int(os.getenv("TWEETS_PER_ACCOUNT", "20"))
+
+# Whether to keep retweets. Defaults to false (usually noisy).
+INCLUDE_RETWEETS = os.getenv("INCLUDE_RETWEETS", "false").lower() == "true"
+
+# Whether to keep replies. Defaults to false (they need context to make sense).
+INCLUDE_REPLIES = os.getenv("INCLUDE_REPLIES", "false").lower() == "true"
+
+# How far back to keep tweets (in hours). Older tweets are dropped.
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "14"))
-MACRO_COUNT = int(os.getenv("MACRO_COUNT", "3"))
-CORPORATE_INNOVATION_COUNT = int(os.getenv("CORPORATE_INNOVATION_COUNT", "7"))
-MAX_ITEMS_TO_AI = int(os.getenv("MAX_ITEMS_TO_AI", "150"))
 
+# Cap on tweets sent to AI (keeps prompt size and cost bounded).
+MAX_TWEETS_TO_AI = int(os.getenv("MAX_TWEETS_TO_AI", "200"))
+
+# ---- AI (DeepSeek) ----
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# ---- Digest layout ----
+MACRO_COUNT = int(os.getenv("MACRO_COUNT", "3"))
+CORPORATE_INNOVATION_COUNT = int(os.getenv("CORPORATE_INNOVATION_COUNT", "7"))
 
 
 # ---------------------------------------------------------------------------
@@ -81,148 +86,293 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 @dataclass
 class VocabEntry:
-    word: str           # English word/phrase from the article
-    japanese: str       # Japanese translation
-    cefr: str = "C1"    # "C1" or "C2"
+    word: str
+    japanese: str
+    cefr: str = "C1"
 
 
 @dataclass
-class NewsItem:
-    title: str
-    link: str
-    summary: str
-    source: str
-    source_weight: float
-    published: datetime
+class Tweet:
+    """One tweet from one account."""
+    id: str
+    text: str              # Full tweet text
+    author_username: str   # Handle without "@"
+    author_display: str    # Display name (e.g. "Elon Musk")
+    author_verified: bool
+    author_followers: int  # Follower count (used as an authority hint)
+    created_at: datetime   # UTC
+    url: str               # https://twitter.com/user/status/id
+    like_count: int = 0
+    retweet_count: int = 0
+    reply_count: int = 0
+    is_reply: bool = False
+    is_retweet: bool = False
+
+    # Filled in by the AI selection step:
     rank: int = 0
     category: str = ""              # "macro" or "corporate_innovation"
     commentary: str = ""            # English commentary
     vocabulary: list[VocabEntry] = field(default_factory=list)
-    also_reported_by: list[str] = field(default_factory=list)
+    also_from: list[str] = field(default_factory=list)  # other accounts on same topic
 
 
 # ---------------------------------------------------------------------------
-# RSS fetching
+# Load account list
 # ---------------------------------------------------------------------------
 
-def parse_published(entry) -> datetime | None:
-    for key in ("published", "updated", "created"):
-        val = entry.get(key)
-        if not val:
-            continue
-        try:
-            dt = date_parser.parse(val)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except (ValueError, TypeError):
-            continue
-    for key in ("published_parsed", "updated_parsed"):
-        val = entry.get(key)
-        if val:
-            try:
-                return datetime(*val[:6], tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _strip_html(text: str) -> str:
-    import re
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def fetch_feed(name: str, url: str, weight: float, cutoff: datetime) -> list[NewsItem]:
-    log.info("Fetching %s", name)
-    items: list[NewsItem] = []
-    try:
-        feed = feedparser.parse(
-            url,
-            request_headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; econ-news-bot/2.0; +https://example.com/bot)"
-                ),
-                "Accept": "application/rss+xml, application/xml, text/xml, */*",
-            },
+def load_accounts() -> list[str]:
+    """Read the accounts file, one username per line, ignoring comments and
+    blank lines. Returns cleaned lowercase list without '@'."""
+    path = Path(ACCOUNTS_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Accounts file not found: {path.absolute()}. "
+            "Create twitter_accounts.txt with one username per line."
         )
-    except Exception as e:
-        log.warning("  %s: fetch error: %s", name, e)
-        return items
-    if feed.bozo and not feed.entries:
-        log.warning("  %s: feed parse error, no entries", name)
-        return items
-    for entry in feed.entries:
-        pub = parse_published(entry)
-        if pub is None or pub < cutoff:
+    accounts: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        title = (entry.get("title") or "").strip()
-        if not title:
-            continue
-        summary = (entry.get("summary") or entry.get("description") or "").strip()
-        summary = _strip_html(summary)[:800]
-        link = entry.get("link") or ""
-        items.append(NewsItem(
-            title=title, link=link, summary=summary,
-            source=name, source_weight=weight, published=pub,
-        ))
-    log.info("  %s: %d recent items", name, len(items))
-    return items
+        # Strip leading @ if present
+        if line.startswith("@"):
+            line = line[1:]
+        line = line.split()[0]  # in case of trailing comments after the handle
+        if line:
+            accounts.append(line.lower())
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for a in accounts:
+        if a not in seen:
+            seen.add(a)
+            unique.append(a)
+    log.info("Loaded %d Twitter accounts from %s", len(unique), path.name)
+    if not unique:
+        raise ValueError(
+            "No accounts found in accounts file. Add usernames (one per line) "
+            "to twitter_accounts.txt."
+        )
+    return unique
 
 
-def fetch_all_news() -> list[NewsItem]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-    all_items: list[NewsItem] = []
-    for name, url, weight in RSS_SOURCES:
-        all_items.extend(fetch_feed(name, url, weight, cutoff))
-    log.info("Fetched %d total items across %d sources",
-             len(all_items), len(RSS_SOURCES))
-    return all_items
+# ---------------------------------------------------------------------------
+# TwitterAPI.io fetching
+# ---------------------------------------------------------------------------
+
+def _parse_iso_datetime(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = date_parser.parse(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 
-def trim_for_ai(items: list[NewsItem]) -> list[NewsItem]:
-    if len(items) <= MAX_ITEMS_TO_AI:
-        return items
-    items_sorted = sorted(
-        items,
-        key=lambda it: (it.source_weight, it.published),
-        reverse=True,
+def _extract_tweet(raw: dict, fallback_username: str) -> Tweet | None:
+    """Convert TwitterAPI.io's raw tweet JSON into our Tweet dataclass.
+    TwitterAPI.io mirrors X's own field names closely."""
+    tid = str(raw.get("id") or "").strip()
+    text = (raw.get("text") or "").strip()
+    if not tid or not text:
+        return None
+
+    # Author info: TwitterAPI.io usually nests author under "author"
+    author = raw.get("author") or {}
+    username = (author.get("userName") or fallback_username or "").lstrip("@").lower()
+    display = author.get("name") or username
+    verified = bool(author.get("isVerified") or author.get("isBlueVerified"))
+    followers = int(author.get("followers") or 0)
+
+    created_at = _parse_iso_datetime(raw.get("createdAt") or "")
+    if created_at is None:
+        return None
+
+    # Determine reply/retweet status. Field names vary a bit; try both.
+    is_reply = bool(
+        raw.get("isReply") or raw.get("inReplyToUsername")
+        or raw.get("inReplyToId")
     )
-    return items_sorted[:MAX_ITEMS_TO_AI]
+    is_retweet = bool(
+        raw.get("isRetweet") or raw.get("retweeted_tweet")
+        or text.startswith("RT @")
+    )
+
+    url = raw.get("url") or f"https://twitter.com/{username}/status/{tid}"
+
+    return Tweet(
+        id=tid,
+        text=text,
+        author_username=username,
+        author_display=display,
+        author_verified=verified,
+        author_followers=followers,
+        created_at=created_at,
+        url=url,
+        like_count=int(raw.get("likeCount") or 0),
+        retweet_count=int(raw.get("retweetCount") or 0),
+        reply_count=int(raw.get("replyCount") or 0),
+        is_reply=is_reply,
+        is_retweet=is_retweet,
+    )
+
+
+def fetch_user_tweets(api_key: str, username: str, cutoff: datetime) -> list[Tweet]:
+    """Fetch the latest tweets from one account, filtered to cutoff time."""
+    url = TWITTERAPI_BASE_URL + TWITTERAPI_ENDPOINT
+    headers = {"X-API-Key": api_key}
+    params = {"userName": username}
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+    except requests.RequestException as e:
+        log.warning("  @%s: request failed: %s", username, e)
+        return []
+
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "TwitterAPI.io rejected the API key (401). "
+            "Check the TWITTERAPI_KEY secret."
+        )
+    if resp.status_code == 402 or "insufficient" in resp.text.lower():
+        raise RuntimeError(
+            "TwitterAPI.io balance is exhausted. "
+            "Top up at https://twitterapi.io."
+        )
+    if resp.status_code != 200:
+        log.warning("  @%s: HTTP %d: %s", username, resp.status_code, resp.text[:200])
+        return []
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        log.warning("  @%s: response was not JSON", username)
+        return []
+
+    # TwitterAPI.io returns tweets under a "tweets" key (sometimes under "data")
+    raw_tweets = (
+        payload.get("tweets")
+        or payload.get("data")
+        or (payload.get("data") or {}).get("tweets")
+        or []
+    )
+    if not raw_tweets:
+        log.info("  @%s: no tweets returned", username)
+        return []
+
+    parsed = []
+    for raw in raw_tweets[:TWEETS_PER_ACCOUNT]:
+        t = _extract_tweet(raw, username)
+        if t and t.created_at >= cutoff:
+            parsed.append(t)
+
+    log.info("  @%s: %d recent tweets (of %d fetched)",
+             username, len(parsed), len(raw_tweets))
+    return parsed
+
+
+def fetch_all_tweets() -> list[Tweet]:
+    """Fetch tweets from every account in the list."""
+    api_key = os.environ.get("TWITTERAPI_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "TWITTERAPI_KEY environment variable is required. "
+            "Get one at https://twitterapi.io"
+        )
+
+    accounts = load_accounts()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    log.info("Fetching tweets since %s from %d accounts...",
+             cutoff.strftime("%Y-%m-%d %H:%M UTC"), len(accounts))
+
+    all_tweets: list[Tweet] = []
+    for i, username in enumerate(accounts, 1):
+        log.info("[%d/%d] Fetching @%s", i, len(accounts), username)
+        tweets = fetch_user_tweets(api_key, username, cutoff)
+        all_tweets.extend(tweets)
+        # Small delay to be polite to the API (also avoids rate-limit hiccups)
+        time.sleep(0.15)
+
+    log.info("Fetched %d total tweets from %d accounts",
+             len(all_tweets), len(accounts))
+    return all_tweets
+
+
+def filter_tweets(tweets: list[Tweet]) -> list[Tweet]:
+    """Drop replies/retweets according to config, and near-duplicates."""
+    kept: list[Tweet] = []
+    seen_prefixes: set[str] = set()
+    for t in tweets:
+        if t.is_reply and not INCLUDE_REPLIES:
+            continue
+        if t.is_retweet and not INCLUDE_RETWEETS:
+            continue
+        if len(t.text.strip()) < 20:
+            continue  # skip trivially short tweets
+        # Dedup based on the first ~80 alphanumeric chars of the text
+        key = "".join(c for c in t.text.lower() if c.isalnum())[:80]
+        if key in seen_prefixes:
+            continue
+        seen_prefixes.add(key)
+        kept.append(t)
+    log.info("After filtering (replies=%s, retweets=%s): %d tweets",
+             INCLUDE_REPLIES, INCLUDE_RETWEETS, len(kept))
+    return kept
+
+
+def trim_for_ai(tweets: list[Tweet]) -> list[Tweet]:
+    """If too many tweets, keep the ones from the most-followed accounts
+    plus the most-engaged tweets, so AI cost stays bounded."""
+    if len(tweets) <= MAX_TWEETS_TO_AI:
+        return tweets
+    # Rank by (engagement * follower authority) so a small account with a viral
+    # tweet still competes with a big account's normal tweet.
+    def _score(t: Tweet) -> float:
+        engagement = t.like_count + 2 * t.retweet_count + t.reply_count
+        # log-scale follower count so mega-accounts don't dominate entirely
+        import math
+        authority = math.log10(max(t.author_followers, 10))
+        return engagement * (1 + authority * 0.5)
+    tweets_sorted = sorted(tweets, key=_score, reverse=True)
+    kept = tweets_sorted[:MAX_TWEETS_TO_AI]
+    log.info("Trimmed to top %d tweets by engagement × authority", len(kept))
+    return kept
 
 
 # ---------------------------------------------------------------------------
 # AI selection and commentary (DeepSeek backend)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""You are a senior economics editor curating a twice-daily news digest for a sophisticated reader who is also studying English at CEFR C1-C2 level.
+SYSTEM_PROMPT = f"""You are a senior economics editor curating a twice-daily digest for a sophisticated reader who is also studying English at CEFR C1-C2 level.
 
-Your task: from a list of recent headlines pulled from major outlets (Reuters, Bloomberg, FT, WSJ, CNBC, BBC, Economist, MarketWatch, Yahoo Finance), pick the 10 most important and impactful stories of the day.
+Your task: from a stream of recent tweets by hand-picked economists, journalists, policymakers, and industry leaders, pick the {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} most important and impactful stories/insights of the day.
 
 Selection criteria:
-- Real economic / market / geopolitical significance, not clickbait
-- Stories reported by multiple major outlets (broader coverage = higher consensus on importance)
-- Surprising / breaking / unexpected developments that move markets
-- A balanced mix across topics: don't pick 8 stories about the same Fed decision
+- Real economic / market / geopolitical / technology significance
+- Prefer tweets that break news, announce material developments, or provide sharp original analysis over reposts of known facts
+- If several accounts tweet about the same story, treat that as a strong signal that it matters (and note them together)
+- A balanced mix across topics: don't pick 8 stories about the same event
 
-Split the 10 picks into two categories:
-- "macro" ({MACRO_COUNT} stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency, geopolitics with macroeconomic impact (trade wars, tariffs, sanctions, supply chain)
+Split the {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} picks into two categories:
+- "macro" ({MACRO_COUNT} stories): global economy & US economy -- central banks, inflation, GDP, jobs, fiscal policy, sovereign debt, broad markets, commodities, currency, geopolitics with macroeconomic impact
 - "corporate_innovation" ({CORPORATE_INNOVATION_COUNT} stories): companies, innovation/tech, M&A, big tech, AI/semiconductors, EVs, biotech, startups
 
-For each pick, provide TWO things:
+For each pick, provide:
 
-1. **commentary** (2-4 sentences in ENGLISH explaining):
-   - Why this story matters (impact, who is affected, why now)
-   - Brief background context if useful for understanding
+1. **commentary** (2-4 sentences in ENGLISH):
+   - What the tweet says and why it matters (impact, who's affected, why now)
+   - Brief background context if useful
 
-2. **vocabulary** (a list of 3-6 CEFR C1-C2 level English words or phrases from the article title/summary/commentary, each with a Japanese translation):
-   - Focus on advanced vocabulary the reader would benefit from learning
-   - Skip A1-B2 level words (common words like "company", "market", "rise")
+2. **vocabulary** (3-6 CEFR C1-C2 English words/phrases from the tweet or commentary, each with a Japanese translation):
+   - Focus on advanced vocabulary useful for an intermediate/advanced English learner
+   - Skip A1-B2 level words
    - Include each word's CEFR level ("C1" or "C2")
-   - Translation should be concise and natural Japanese
+   - Translation should be concise natural Japanese
 
-Also note which outlets reported the same story (using the input list -- match by content similarity, not exact title).
+3. **also_from_ids**: IDs of OTHER tweets in the input that discuss the same story/topic
 
 Return your answer as STRICT JSON in this exact structure. Do NOT wrap in markdown fences. Do NOT add prose:
 {{
@@ -233,24 +383,24 @@ Return your answer as STRICT JSON in this exact structure. Do NOT wrap in markdo
       "vocabulary": [
         {{"word": "<English word/phrase>", "japanese": "<Japanese translation>", "cefr": "C1"}}
       ],
-      "also_reported_by_ids": [<ids of other items covering the same story>]
+      "also_from_ids": [<ids of other tweets covering the same story>]
     }}
   ],
   "corporate_innovation": [
-    {{"id": <int>, "commentary": "<...>", "vocabulary": [...], "also_reported_by_ids": [<int>]}}
+    {{"id": <int>, "commentary": "<...>", "vocabulary": [...], "also_from_ids": [<int>]}}
   ]
 }}
 
-Important rules:
+Rules:
 - Output ONLY valid JSON, nothing else
-- Exactly {MACRO_COUNT} items in "macro" and {CORPORATE_INNOVATION_COUNT} in "corporate_innovation" ({MACRO_COUNT + CORPORATE_INNOVATION_COUNT} total)
+- Exactly {MACRO_COUNT} items in "macro" and {CORPORATE_INNOVATION_COUNT} in "corporate_innovation"
 - commentary MUST be in English
 - Japanese translations MUST be in Japanese (日本語), not Chinese or romaji
 - Each vocabulary entry's cefr field must be "C1" or "C2"
-- also_reported_by_ids may be empty list if no other outlet covered it"""
+- also_from_ids may be an empty list"""
 
 
-def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
+def select_with_ai(tweets: list[Tweet]) -> list[Tweet]:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -260,25 +410,29 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
     client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
     catalog_lines = []
-    for i, it in enumerate(items):
-        time_str = it.published.strftime("%Y-%m-%d %H:%M UTC")
-        snippet = it.summary[:400] if it.summary else ""
+    for i, t in enumerate(tweets):
+        time_str = t.created_at.strftime("%Y-%m-%d %H:%M UTC")
+        verified_mark = " ✓" if t.author_verified else ""
+        # Truncate very long tweets to keep prompt size sane
+        text_short = t.text if len(t.text) <= 500 else t.text[:500] + "…"
         catalog_lines.append(
-            f"[id={i}] [{it.source}] [{time_str}]\n"
-            f"  Title: {it.title}\n"
-            f"  Summary: {snippet}"
+            f"[id={i}] @{t.author_username}{verified_mark} "
+            f"({t.author_followers:,} followers) [{time_str}] "
+            f"[❤️ {t.like_count:,} 🔁 {t.retweet_count:,} 💬 {t.reply_count:,}]\n"
+            f"  {text_short}"
         )
     catalog = "\n\n".join(catalog_lines)
 
     user_message = (
-        f"Here are {len(items)} recent economic news items from major outlets. "
-        f"Select the {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} most important and write commentary "
-        f"plus a CEFR C1-C2 vocabulary list with Japanese translations as instructed.\n\n"
-        f"--- ITEMS ---\n{catalog}"
+        f"Here are {len(tweets)} recent tweets from hand-picked economists, "
+        f"journalists, and industry leaders. Select the "
+        f"{MACRO_COUNT + CORPORATE_INNOVATION_COUNT} most important stories/insights "
+        f"and write commentary + CEFR C1-C2 vocabulary as instructed.\n\n"
+        f"--- TWEETS ---\n{catalog}"
     )
 
-    log.info("Calling DeepSeek (%s) with %d candidate items...",
-             DEEPSEEK_MODEL, len(items))
+    log.info("Calling DeepSeek (%s) with %d candidate tweets...",
+             DEEPSEEK_MODEL, len(tweets))
 
     try:
         response = client.chat.completions.create(
@@ -294,12 +448,9 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
     except Exception as e:
         msg = str(e)
         if "402" in msg or "Insufficient Balance" in msg:
-            log.error(
-                "DeepSeek API balance is 0. Top up at https://platform.deepseek.com "
-                "(usually $2-5 lasts for months)."
-            )
+            log.error("DeepSeek balance is 0. Top up at https://platform.deepseek.com")
         elif "401" in msg or "Authentication" in msg:
-            log.error("DeepSeek API key is invalid. Check the DEEPSEEK_API_KEY secret.")
+            log.error("DeepSeek API key is invalid. Check DEEPSEEK_API_KEY secret.")
         else:
             log.error("DeepSeek API call failed: %s", msg)
         raise
@@ -332,44 +483,42 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
         log.error("Raw response: %s", raw_text[:1000])
         raise
 
-    selected: list[NewsItem] = []
+    selected: list[Tweet] = []
     for category in ("macro", "corporate_innovation"):
         picks = parsed.get(category, [])
         for rank, pick in enumerate(picks, start=1):
             try:
-                item_id = int(pick["id"])
-                item = items[item_id]
+                tid = int(pick["id"])
+                t = tweets[tid]
             except (KeyError, ValueError, IndexError) as e:
                 log.warning("Skipping invalid pick %s: %s", pick, e)
                 continue
-            item.category = category
-            item.rank = rank
-            item.commentary = pick.get("commentary", "").strip()
+            t.category = category
+            t.rank = rank
+            t.commentary = pick.get("commentary", "").strip()
 
-            # Parse vocabulary list
-            vocab_list = []
+            vocab = []
             for v in pick.get("vocabulary", []):
                 try:
                     word = str(v.get("word", "")).strip()
                     jp = str(v.get("japanese", "")).strip()
                     cefr = str(v.get("cefr", "C1")).strip().upper()
                     if word and jp:
-                        vocab_list.append(VocabEntry(word=word, japanese=jp, cefr=cefr))
+                        vocab.append(VocabEntry(word=word, japanese=jp, cefr=cefr))
                 except (AttributeError, TypeError):
                     continue
-            item.vocabulary = vocab_list
+            t.vocabulary = vocab
 
-            also_ids = pick.get("also_reported_by_ids", [])
-            also_outlets = []
-            for aid in also_ids:
+            also = []
+            for aid in pick.get("also_from_ids", []):
                 try:
-                    also_outlets.append(items[int(aid)].source)
+                    also.append("@" + tweets[int(aid)].author_username)
                 except (ValueError, IndexError):
                     continue
-            item.also_reported_by = sorted(set(also_outlets) - {item.source})
-            selected.append(item)
+            t.also_from = sorted(set(also) - {"@" + t.author_username})
+            selected.append(t)
 
-    log.info("AI selected %d items (%d macro + %d corp/innov)",
+    log.info("AI selected %d tweets (%d macro + %d corp/innov)",
              len(selected),
              sum(1 for x in selected if x.category == "macro"),
              sum(1 for x in selected if x.category == "corporate_innovation"))
@@ -380,51 +529,40 @@ def select_with_ai(items: list[NewsItem]) -> list[NewsItem]:
 # Email rendering
 # ---------------------------------------------------------------------------
 
-def _collect_all_vocab(items: list[NewsItem]) -> list[tuple[VocabEntry, int]]:
-    """Collect all vocabulary across items, paired with their article index."""
+def _collect_all_vocab(tweets: list[Tweet]) -> list[tuple[VocabEntry, int]]:
     result = []
-    for idx, it in enumerate(items, start=1):
-        for v in it.vocabulary:
+    for idx, t in enumerate(tweets, start=1):
+        for v in t.vocabulary:
             result.append((v, idx))
     return result
 
 
-def build_email_html(items: list[NewsItem], edition_en: str) -> str:
+def build_email_html(tweets: list[Tweet], edition_en: str) -> str:
     today_str = datetime.now().strftime("%A, %B %d, %Y")
-    macro = [it for it in items if it.category == "macro"]
-    corp = [it for it in items if it.category == "corporate_innovation"]
+    macro = [t for t in tweets if t.category == "macro"]
+    corp = [t for t in tweets if t.category == "corporate_innovation"]
 
-    # ---------- Vocabulary index at the top ----------
-    # Layout: one word per row, full width. Three columns:
-    #   [article# + CEFR badge]   [English word]   [Japanese translation]
-    # Uses a simple table -- renders identically on Gmail, Apple Mail, Outlook,
-    # and mobile clients. Each row stretches to the full available width.
-    all_vocab = _collect_all_vocab(items)
+    # ---------- Vocabulary index ----------
+    all_vocab = _collect_all_vocab(tweets)
     vocab_section = ""
     if all_vocab:
         vocab_rows = []
-        for i, (v, article_idx) in enumerate(all_vocab):
+        for i, (v, idx) in enumerate(all_vocab):
             cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
             cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
-            # Subtle zebra striping for readability
             row_bg = "#ffffff" if i % 2 == 0 else "#faf8ff"
             vocab_rows.append(
                 f'<tr style="background:{row_bg};">'
-                # Article number + CEFR badge (compact, left-aligned)
                 f'<td style="padding:8px 10px;vertical-align:middle;white-space:nowrap;'
                 f'font-size:11px;color:{cefr_color};font-weight:700;">'
                 f'<span style="display:inline-block;background:{cefr_bg};'
                 f'padding:2px 7px;border-radius:8px;">'
-                f'#{article_idx} &middot; {escape(v.cefr)}</span>'
+                f'#{idx} &middot; {escape(v.cefr)}</span>'
                 f'</td>'
-                # English word
                 f'<td style="padding:8px 10px;vertical-align:middle;'
-                f'font-size:14px;font-weight:600;color:#111;">'
-                f'{escape(v.word)}</td>'
-                # Japanese translation (takes remaining width)
+                f'font-size:14px;font-weight:600;color:#111;">{escape(v.word)}</td>'
                 f'<td style="padding:8px 10px;vertical-align:middle;'
-                f'font-size:14px;color:#555;width:100%;">'
-                f'{escape(v.japanese)}</td>'
+                f'font-size:14px;color:#555;width:100%;">{escape(v.japanese)}</td>'
                 f'</tr>'
             )
         vocab_section = f"""
@@ -434,8 +572,8 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
               📚 Vocabulary (CEFR C1-C2)
             </div>
             <div style="font-size:11px;color:#888;margin-top:3px;">
-              Advanced English vocabulary from today's articles, with Japanese translations.
-              <span style="color:#aaa;">#N = article number</span>
+              Advanced English vocabulary from today's tweets, with Japanese translations.
+              <span style="color:#aaa;">#N = tweet number</span>
             </div>
           </td></tr>
           <tr><td style="padding:10px 0 14px 0;">
@@ -447,43 +585,55 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
         """
 
     # ---------- Article sections ----------
-    def _section(title: str, subtitle: str, section_items: list[NewsItem], start_idx: int) -> str:
-        if not section_items:
+    def _section(title: str, subtitle: str, section_tweets: list[Tweet], start_idx: int) -> str:
+        if not section_tweets:
             return ""
         rows = []
-        for i, it in enumerate(section_items, start=start_idx):
-            published_local = it.published.astimezone().strftime("%H:%M %Z")
-            n_outlets = 1 + len(it.also_reported_by)
-            if n_outlets >= 2:
+        for i, t in enumerate(section_tweets, start=start_idx):
+            local_time = t.created_at.astimezone().strftime("%H:%M %Z")
+            n_from = 1 + len(t.also_from)
+            if n_from >= 2:
                 badge = (
                     f'<span style="display:inline-block;background:#d1f5e0;color:#0a6b2c;'
                     f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
-                    f'margin-left:6px;">📢 {n_outlets} outlets</span>'
+                    f'margin-left:6px;">📢 {n_from} accounts</span>'
                 )
-                outlets_line = (
+                also_line = (
                     f'<div style="color:#888;font-size:11px;margin-top:3px;">'
-                    f'Also reported by: {escape(", ".join(it.also_reported_by[:6]))}'
-                    f'{"…" if len(it.also_reported_by) > 6 else ""}'
+                    f'Also tweeting: {escape(", ".join(t.also_from[:6]))}'
+                    f'{"…" if len(t.also_from) > 6 else ""}'
                     f'</div>'
                 )
             else:
                 badge = ""
-                outlets_line = ""
+                also_line = ""
+
+            verified_mark = ' <span style="color:#1d9bf0;">✓</span>' if t.author_verified else ""
+            engagement = (
+                f'<span style="color:#888;font-size:11px;">'
+                f'❤️ {t.like_count:,} &middot; 🔁 {t.retweet_count:,} &middot; 💬 {t.reply_count:,}'
+                f'</span>'
+            )
+
+            # The tweet text itself (this replaces the RSS headline)
+            tweet_text_html = (
+                f'<div style="color:#111;font-size:14px;line-height:1.5;'
+                f'margin-top:6px;white-space:pre-wrap;">{escape(t.text)}</div>'
+            )
 
             commentary_html = ""
-            if it.commentary:
+            if t.commentary:
                 commentary_html = (
                     f'<div style="background:#f8f9fb;border-left:3px solid #1a4d8c;'
                     f'padding:10px 14px;margin-top:10px;color:#222;font-size:13px;'
                     f'line-height:1.6;border-radius:0 4px 4px 0;">'
-                    f'{escape(it.commentary)}</div>'
+                    f'{escape(t.commentary)}</div>'
                 )
 
-            # Per-article vocabulary -- same one-row-per-word layout as the index.
             vocab_inline = ""
-            if it.vocabulary:
+            if t.vocabulary:
                 vocab_rows_local = []
-                for v in it.vocabulary:
+                for v in t.vocabulary:
                     cefr_color = "#7a3fd8" if v.cefr == "C2" else "#1a4d8c"
                     cefr_bg = "#f3ebff" if v.cefr == "C2" else "#eaf2fb"
                     vocab_rows_local.append(
@@ -510,13 +660,17 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
                 <tr>
                   <td style="padding:16px 8px;vertical-align:top;font-weight:bold;color:#888;width:30px;">{i}.</td>
                   <td style="padding:16px 8px;vertical-align:top;">
-                    <a href="{escape(it.link)}" style="color:#1a4d8c;text-decoration:none;font-weight:600;font-size:15px;">
-                      {escape(it.title)}
-                    </a>{badge}
-                    <div style="color:#666;font-size:12px;margin-top:4px;">
-                      {escape(it.source)} &middot; {published_local}
+                    <div>
+                      <a href="{escape(t.url)}" style="color:#1a4d8c;text-decoration:none;font-weight:600;font-size:14px;">
+                        {escape(t.author_display)}{verified_mark}
+                        <span style="color:#888;font-weight:normal;">@{escape(t.author_username)}</span>
+                      </a>{badge}
                     </div>
-                    {outlets_line}
+                    <div style="color:#666;font-size:11px;margin-top:2px;">
+                      {local_time} &middot; {engagement}
+                    </div>
+                    {also_line}
+                    {tweet_text_html}
                     {commentary_html}
                     {vocab_inline}
                   </td>
@@ -549,7 +703,7 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
   <table style="max-width:680px;width:100%;margin:0 auto;background:#fff;border-radius:6px;padding:16px;box-sizing:border-box;">
     <tr><td>
       <h1 style="margin:0 0 4px 0;font-size:22px;color:#1a4d8c;">
-        Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines
+        Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Tweets
       </h1>
       <div style="color:#888;font-size:13px;margin-bottom:20px;">
         {edition_en} &middot; {today_str}
@@ -560,53 +714,54 @@ def build_email_html(items: list[NewsItem], edition_en: str) -> str:
         {corp_section}
       </table>
       <div style="color:#aaa;font-size:11px;margin-top:24px;border-top:1px solid #eee;padding-top:12px;">
-        Curated by AI (DeepSeek) from {len(RSS_SOURCES)} sources. Commentary in English with CEFR C1-C2 vocabulary translated to Japanese.
+        Curated by AI (DeepSeek) from tweets by hand-picked economists, journalists, and industry leaders.
       </div>
     </td></tr>
   </table>
 </body></html>"""
 
 
-def build_email_text(items: list[NewsItem], edition_en: str) -> str:
+def build_email_text(tweets: list[Tweet], edition_en: str) -> str:
     today_str = datetime.now().strftime("%A, %B %d, %Y")
-    macro = [it for it in items if it.category == "macro"]
-    corp = [it for it in items if it.category == "corporate_innovation"]
+    macro = [t for t in tweets if t.category == "macro"]
+    corp = [t for t in tweets if t.category == "corporate_innovation"]
     lines = [
-        f"Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines -- {edition_en}",
+        f"Today's Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Tweets -- {edition_en}",
         today_str,
         "=" * 60,
         "",
     ]
 
-    # Vocabulary index
-    all_vocab = _collect_all_vocab(items)
+    all_vocab = _collect_all_vocab(tweets)
     if all_vocab:
         lines.append("## 📚 VOCABULARY (CEFR C1-C2)")
         lines.append("-" * 60)
-        for v, article_idx in all_vocab:
-            lines.append(f"  #{article_idx} [{v.cefr}] {v.word} = {v.japanese}")
+        for v, idx in all_vocab:
+            lines.append(f"  #{idx} [{v.cefr}] {v.word} = {v.japanese}")
         lines.append("")
 
-    def _add(header: str, section: list[NewsItem], start_idx: int) -> None:
+    def _add(header: str, section: list[Tweet], start_idx: int) -> None:
         if not section:
             return
         lines.append(f"## {header}")
         lines.append("-" * 60)
-        for i, it in enumerate(section, start=start_idx):
-            time = it.published.astimezone().strftime("%H:%M %Z")
-            n_outlets = 1 + len(it.also_reported_by)
-            badge = f" [📢 {n_outlets} outlets]" if n_outlets >= 2 else ""
-            lines.append(f"{i}. {it.title}{badge}")
-            lines.append(f"   {it.source} | {time}")
-            if it.also_reported_by:
-                lines.append(f"   Also reported by: {', '.join(it.also_reported_by[:6])}"
-                             f"{'…' if len(it.also_reported_by) > 6 else ''}")
-            if it.commentary:
-                lines.append(f"   💬 {it.commentary}")
-            if it.vocabulary:
-                vocab_str = ", ".join(f"{v.word}={v.japanese}({v.cefr})" for v in it.vocabulary)
-                lines.append(f"   📚 {vocab_str}")
-            lines.append(f"   {it.link}")
+        for i, t in enumerate(section, start=start_idx):
+            local_time = t.created_at.astimezone().strftime("%H:%M %Z")
+            n_from = 1 + len(t.also_from)
+            badge = f" [📢 {n_from} accounts]" if n_from >= 2 else ""
+            verified = " ✓" if t.author_verified else ""
+            lines.append(f"{i}. @{t.author_username}{verified} ({t.author_display}){badge}")
+            lines.append(f"   {local_time} | ❤️ {t.like_count:,} 🔁 {t.retweet_count:,}")
+            if t.also_from:
+                lines.append(f"   Also tweeting: {', '.join(t.also_from[:6])}"
+                             f"{'…' if len(t.also_from) > 6 else ''}")
+            lines.append(f"   \"{t.text[:500]}{'…' if len(t.text) > 500 else ''}\"")
+            if t.commentary:
+                lines.append(f"   💬 {t.commentary}")
+            if t.vocabulary:
+                vs = ", ".join(f"{v.word}={v.japanese}({v.cefr})" for v in t.vocabulary)
+                lines.append(f"   📚 {vs}")
+            lines.append(f"   {t.url}")
             lines.append("")
 
     _add("MACRO -- World & US economy", macro, 1)
@@ -614,7 +769,7 @@ def build_email_text(items: list[NewsItem], edition_en: str) -> str:
     return "\n".join(lines)
 
 
-def send_email(items: list[NewsItem]) -> None:
+def send_email(tweets: list[Tweet]) -> None:
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.environ["SMTP_USER"]
@@ -628,13 +783,13 @@ def send_email(items: list[NewsItem]) -> None:
 
     msg = EmailMessage()
     msg["Subject"] = (
-        f"📊 Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Economic Headlines -- "
+        f"🐦 Top {MACRO_COUNT + CORPORATE_INNOVATION_COUNT} Tweets -- "
         f"{edition_en} ({datetime.now().strftime('%b %d')})"
     )
     msg["From"] = formataddr((from_name, from_addr))
     msg["To"] = ", ".join(to_addrs)
-    msg.set_content(build_email_text(items, edition_en))
-    msg.add_alternative(build_email_html(items, edition_en), subtype="html")
+    msg.set_content(build_email_text(tweets, edition_en))
+    msg.add_alternative(build_email_html(tweets, edition_en), subtype="html")
 
     log.info("Sending email to %s via %s:%d", to_addrs, smtp_host, smtp_port)
     context = ssl.create_default_context()
@@ -652,30 +807,34 @@ def send_email(items: list[NewsItem]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    log.info("=== econ_news_bot (AI/DeepSeek) run start ===")
-    items = fetch_all_news()
-    if not items:
-        log.warning("No items fetched -- all feeds may be down. Skipping email.")
+    log.info("=== econ_news_bot (Twitter + AI) run start ===")
+    tweets = fetch_all_tweets()
+    if not tweets:
+        log.warning("No tweets fetched. Skipping email.")
         return 1
 
-    items = trim_for_ai(items)
-    log.info("Sending %d items to AI for selection", len(items))
+    tweets = filter_tweets(tweets)
+    if not tweets:
+        log.warning("No tweets left after filtering. Skipping email.")
+        return 1
 
-    selected = select_with_ai(items)
+    tweets = trim_for_ai(tweets)
+    log.info("Sending %d tweets to AI for selection", len(tweets))
+
+    selected = select_with_ai(tweets)
     if not selected:
-        log.warning("AI returned no items. Skipping email.")
+        log.warning("AI returned no tweets. Skipping email.")
         return 1
 
-    selected.sort(key=lambda it: (
-        0 if it.category == "macro" else 1, it.rank,
+    selected.sort(key=lambda t: (
+        0 if t.category == "macro" else 1, t.rank,
     ))
 
     log.info("Top %d picks:", len(selected))
-    for it in selected:
-        n_outlets = 1 + len(it.also_reported_by)
-        log.info("  %s #%d [%d outlets, %d vocab] %s -- %s",
-                 it.category, it.rank, n_outlets, len(it.vocabulary),
-                 it.source, it.title[:60])
+    for t in selected:
+        log.info("  %s #%d [@%s, %d vocab] %s",
+                 t.category, t.rank, t.author_username,
+                 len(t.vocabulary), t.text[:60])
 
     send_email(selected)
     log.info("=== econ_news_bot run done ===")
