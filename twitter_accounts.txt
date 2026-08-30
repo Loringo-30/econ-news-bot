@@ -14,11 +14,16 @@ ecb
 bankofjapan
 LHSummers
 paulkrugman
+DeItaone
+KobeissiLetter
+spectatorindex
+financialjuice
 
 # ---- Financial journalists ----
 lisaabramowicz1
 tracyalloway
 jasonzweigwsj
+Newsquawk
 
 # ---- Big tech / AI ----
 elonmusk
@@ -30,3 +35,4 @@ satyanadella
 jimcramer
 markets
 ftfinancialnews
+D_Jimenez_Sch
