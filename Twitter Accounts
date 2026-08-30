@@ -1,0 +1,32 @@
+# Twitter/X accounts to fetch tweets from.
+# One username per line, WITHOUT the "@" symbol.
+# Lines starting with "#" are ignored (comments).
+# Empty lines are OK.
+#
+# Add up to ~30-50 accounts. More = higher cost + longer AI processing time.
+# Suggested cost: 30 accounts × 2 runs/day ≈ $1-5/month on TwitterAPI.io.
+#
+# Example (delete and replace with your own):
+
+# ---- Macro economists / Central bank watchers ----
+# federalreserve
+# ecb
+# bankofjapan
+# LHSummers
+# paulkrugman
+
+# ---- Financial journalists ----
+# lisaabramowicz1
+# tracyalloway
+# jasonzweigwsj
+
+# ---- Big tech / AI ----
+# elonmusk
+# sama
+# sundarpichai
+# satyanadella
+
+# ---- Business / markets ----
+# jimcramer
+# markets
+# ftfinancialnews
